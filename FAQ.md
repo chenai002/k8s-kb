@@ -1514,6 +1514,90 @@ K8s 原生的 `RollingUpdate` **不属于上面任何一种**：它只保证「�
 - 「local PV 和 hostPath 的区别？」local PV 有 PV/PVC 抽象、有 nodeAffinity、生命周期由存储管理；hostPath 没有。
 - 「emptyDir 的 InMemory 会 OOM 吗？」会，计入 Pod 内存限制。
 
+### 66.1 emptyDir 具体是干什么用的？
+
+**要点**：Pod 级别的**临时目录**——Pod 创建时创建、删除时删除。名字里的 "empty" 指**创建时是空的**，不是"用完清空"。它的生命周期与 **Pod** 对齐，而不是与容器对齐。
+
+**为什么需要它**：容器可写层随容器消亡，而有些数据需要活得**比容器长一点**、又能被**同 Pod 的多个容器**共享。
+
+#### 1. 典型用途
+
+| 场景 | 做法 |
+| --- | --- |
+| **同 Pod 内容器共享文件** | app 写日志目录，fluent-bit sidecar 读同一目录 |
+| **Init 容器准备数据给主容器** | init 下载模型/配置到 emptyDir，主容器直接读 |
+| **容器重启不丢临时数据** | emptyDir 挂在 Pod 上，容器重启数据保留 |
+| **只读根文件系统下的可写目录** | `readOnlyRootFilesystem: true` + 把 `/tmp`、`/var/cache/*` 挂 emptyDir |
+| **高性能临时空间** | `medium: Memory` 做编译缓存、临时排序 |
+
+```yaml
+containers:
+  - name: app
+    volumeMounts: [{ name: logs, mountPath: /var/log/app }]
+  - name: logshipper
+    volumeMounts: [{ name: logs, mountPath: /var/log/app }]
+volumes:
+  - name: logs
+    emptyDir: {}
+```
+
+同一个 emptyDir 挂到多个容器时，它们看到的是**同一份数据**（不是各自一份副本）。
+
+#### 2. 两种介质
+
+```yaml
+- name: scratch
+  emptyDir: {}                       # 默认：节点磁盘
+
+- name: fast
+  emptyDir:
+    medium: Memory                   # tmpfs，走内存
+    sizeLimit: 256Mi
+```
+
+| | 默认（磁盘） | `medium: Memory`（tmpfs） |
+| --- | --- | --- |
+| 速度 | 受磁盘 IO 限制 | 极快 |
+| 占用 | 节点磁盘（计入 `ephemeral-storage`） | **计入容器内存限制** |
+| 节点重启 | 丢失 | 丢失 |
+| 适合 | 缓存、中间文件、日志缓冲 | 低延迟临时数据、敏感数据 |
+
+**内存型的坑**：它**算进 Pod 的内存用量**，写满可能触发 **OOMKilled**。
+
+#### 3. 生命周期对照（最容易被误解）
+
+| 事件 | emptyDir 数据 |
+| --- | --- |
+| 容器崩溃重启（CrashLoop） | **保留** |
+| 容器被重建 | **保留** |
+| Pod 被删除 / 重建（滚动更新） | **丢失** |
+| 节点宕机 / Pod 驱逐 | **丢失** |
+
+**所以它不能存数据库数据**：Deployment 一次滚动更新就重建 Pod，数据直接没了。持久化必须用 PVC。
+
+#### 4. 与其他存储的对比
+
+| | emptyDir | hostPath | PVC |
+| --- | --- | --- | --- |
+| 生命周期 | **跟 Pod** | 跟节点 | 独立于 Pod |
+| 跨节点 | ❌ | ❌ | ✅ |
+| 多 Pod 共享 | ❌（限同 Pod） | ✅（同节点） | ✅（看访问模式） |
+| 安全风险 | 低 | **高**（可读写节点路径） | 低 |
+| 适合 | 临时数据、同 Pod 共享 | 节点级 agent / 设备 | 需持久化的数据 |
+
+#### 5. 常见坑
+
+- **以为它能持久化**：Pod 一删就没。
+- **不设 `sizeLimit`**：磁盘型可能写满节点，触发 `DiskPressure` 驱逐。
+- **内存型不控大小**：撑爆容器内存限制 → OOMKilled。
+- **忘记 `ephemeral-storage`**：大量 emptyDir 会消耗节点临时存储，Pod 可能因超限被驱逐。
+- **误以为能跨 Pod 共享**：不能，跨 Pod 要用 PVC 或 hostPath。
+
+**面试加分点**：
+- 「emptyDir 和 ConfigMap/Secret 卷的区别？」前者**可写**、内容由容器产生；后者**只读**、内容由 K8s 管理。
+- 「为什么生产常配 `readOnlyRootFilesystem` + emptyDir？」安全基线上要求根文件系统只读，把必须可写的少数路径显式挂 emptyDir，既满足应用又限制写入面。
+- 「能用 emptyDir 做跨 Pod 缓存的共享吗？」不能，它只在同一个 Pod 内共享。
+
 ### 67. 如何扩展 PVC 容量？
 
 **要点**：SC 开 `allowVolumeExpansion: true`，patch PVC 的 `requests.storage`，驱动执行扩容。
@@ -2279,6 +2363,7 @@ K8s 原生的 `RollingUpdate` **不属于上面任何一种**：它只保证「�
 | 优雅下线 | SIGTERM + preStop + 足够 grace period |
 | 有状态服务 | StatefulSet + PVC 模板 + Operator |
 | StatefulSet 管理 | 稳定身份（名字/DNS/PVC）+ 默认有序 + 逆序更新；partition 控升级 |
+| emptyDir | 跟 Pod 生灭；可 `medium: Memory`；**容器重启保留、Pod 重建丢失** |
 | 网络隔离 | NetworkPolicy，需要 CNI 支持 |
 | 权限最小化 | RBAC + PSA + drop capabilities |
 | 发布策略 | 滚动 / 蓝绿 / 金丝雀 / 灰度，配合 PDB |
