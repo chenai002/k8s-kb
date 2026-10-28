@@ -229,7 +229,58 @@ Cluster 是「一组上游端点 + 连接策略」。
 | `http2_protocol_options` | 启用 HTTP/2 上游（gRPC 必需） |
 | `common_lb_config` | 区域感知（locality weighted）、panic 模式 |
 
-### 3.6 Endpoint 与健康状态
+> ⚠️ **和 Kubernetes 的 "Cluster" 同名，但完全无关**，见 [3.6](#36-envoy-的-cluster不属于-kubernetes-的-cluster)。
+
+### 3.6 Envoy 的 Cluster，不属于 Kubernetes 的 Cluster
+
+Envoy 文档里的 "Cluster" 是个**高频混淆点**，因为 Kubernetes 里也有 "Cluster"。两者没有任何关系，只是重名。
+
+| | **Envoy Cluster** | **Kubernetes Cluster** |
+| --- | --- | --- |
+| 是什么 | 一组提供同一服务的上游端点 + 连接策略 | 一整套 K8s 运行环境（控制面 + etcd + 节点） |
+| 粒度 | 配置对象，一个 sidecar 里可能有几十上百个 | 基础设施单位，一个代理通常只属于一个 |
+| 类比 | 「一条目的地清单」 | 「一整个公司」 |
+
+**一句话**：Envoy 的 Cluster 是「**一组 Pod IP 的逻辑分组**」，Kubernetes 的 Cluster 是「**整个集群**」。
+
+#### 为什么容易混
+
+因为 Istio 给 Envoy cluster 起的名字里，**恰好嵌了 K8s 的域名**：
+
+```
+outbound|9080||reviews.shop.svc.cluster.local
+                 ^^^^^^ ^^^^^^^
+                  │      └─ namespace
+                  └─ 这是 K8s 的 Service DNS 后缀
+```
+
+- `.svc.cluster.local` 里的 `cluster` 指的是 **K8s 集群的 DNS 域**（可以改）。
+- `outbound|9080||reviews.shop.svc.cluster.local` 整体是 **Envoy cluster 的名字**，它只是**借用了 K8s 的域名来命名**，方便阅读。
+- Envoy cluster 名字的通用格式是 `<direction>|<port>|<subset>|<host>`，例如 `inbound|9080||`。
+
+**名字里带 cluster，不代表它是一台集群。**
+
+#### "cluster" 一词在同一个技术栈里的五种含义
+
+| 出现位置 | "cluster" 指的是 |
+| --- | --- |
+| Envoy 配置的 `clusters:` | 一组上游端点 + 负载均衡/连接策略 |
+| Istio 生成的 cluster 名字（`outbound\|9080\|\|...`） | 同上，名字借用了 K8s DNS |
+| Envoy bootstrap 的 `node.cluster` | **代理所属的逻辑分组**（用于控制面按分组下发配置），又是一个不同的意思 |
+| K8s 的 `cluster.local` | K8s 集群的 DNS 域后缀 |
+| SPIFFE 身份 `spiffe://cluster.local/ns/<ns>/sa/<sa>` | **信任域（trust domain）的默认名**，可通过 `meshConfig.trustDomain` 修改 |
+
+#### 怎么验证
+
+```bash
+# 看这个 sidecar 里到底有多少个"Envoy cluster"
+istioctl proxy-config clusters <pod> -n <ns>
+
+# 名字里的 cluster.local 只是 DNS 域名，不是集群对象
+istioctl proxy-config clusters <pod> -n <ns> -o json | jq -r '.[].name' | head
+```
+
+### 3.7 Endpoint 与健康状态
 
 Endpoint 有几类状态：
 
@@ -240,7 +291,7 @@ Endpoint 有几类状态：
 
 **Panic 模式**：当健康端点比例低于 `healthy_panic_threshold`（默认 50%）时，Envoy 会忽略健康检查结果、把流量发给所有端点。这是「宁可发错也不全挂」的兜底设计，但也会把流量打到异常实例上，排障时要能识别。
 
-### 3.7 最小可运行示例
+### 3.8 最小可运行示例
 
 ```yaml
 static_resources:
