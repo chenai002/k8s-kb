@@ -507,6 +507,63 @@
 - 「kubelet 报 `failed to pull image` 但 docker pull 正常？」因为 kubelet 用的是 containerd 的镜像存储，凭据和 registry 配置（`/etc/containerd/config.toml` 的 `config_path`）不同。
 - 运行时性能差异（cgroup v2、seccomp、rootless）是安全与性能权衡的常见追问。
 
+### 25.1 RuntimeClass 是什么？
+
+**要点**：一种**集群级**资源，用来声明「某个容器运行时」，并让 Pod 通过 `runtimeClassName` 指定它。一句话：**给 Pod 选运行时的插槽**。
+
+**展开**：
+
+三个核心字段：
+
+```yaml
+apiVersion: node.k8s.io/v1
+kind: RuntimeClass
+metadata:
+  name: gvisor
+handler: runsc                 # 必填：对应节点 CRI 配置里的 handler 名
+overhead:                      # 可选：该运行时额外开销，调度时预留
+  podFixed: { cpu: 250m, memory: 64Mi }
+scheduling:                    # 可选：限定只能调度到装了该运行时的节点
+  nodeSelector: { sandbox.gke.io/runtime: gvisor }
+  tolerations:
+    - { key: sandbox.gke.io/runtime, operator: Exists, effect: NoSchedule }
+```
+
+- **`handler`** 必须与节点 containerd 配置中定义的 runtime handler **名字完全一致**，否则报 `failed to find runtime "xxx"`。
+- **`overhead`** 主要给 VM 类运行时（Kata）用：每个 Pod 多占一份 VM 开销，不声明会导致调度超卖。
+- **`scheduling`** 防止 Pod 被调度到没装该运行时的节点（否则 `FailedCreatePodSandBox`）。
+
+使用方式：
+
+```yaml
+spec:
+  runtimeClassName: gvisor     # 仅这一行
+```
+
+**端到端链路**：
+```
+Pod 指定 runtimeClassName
+  → 调度器按 scheduling 选节点，并按 overhead 预留资源
+  → kubelet 查 RuntimeClass 得到 handler
+  → 通过 CRI 告诉 containerd「用这个 handler」
+  → containerd 启动对应 shim（如 containerd-shim-runsc-v1）
+```
+
+**与相邻概念的区别**：
+
+| 对比 | 区别 |
+| --- | --- |
+| vs 镜像 | 镜像决定「跑什么」，RuntimeClass 决定「在什么环境里跑」 |
+| vs 节点标签 | 标签是「选节点」，RuntimeClass 是「选运行时」，可顺带带出节点约束 |
+| vs `securityContext` | 前者换底层隔离机制，后者限制进程权限；**互补而非替代** |
+| vs device plugin | 后者提供资源（GPU），前者只选运行时、不提供资源 |
+
+**面试加分点**：
+- 「RuntimeClass 是命名空间级还是集群级？」**集群级**，无 namespace 字段。
+- 「改了 RuntimeClass 会重启已有 Pod 吗？」不会，只对新建 Pod 生效。
+- 「怎么验证真的用上了 gVisor？」`kubectl exec <pod> -- uname -r` 会显示假版本号（如 `4.4.0`），与节点内核版本不同。
+- 「能否替代多租户隔离？」不能，它只解决内核级隔离这一层，还要 RBAC + NetworkPolicy + 配额配合。
+
 ### 26. CNI 是什么？常见插件有哪些？
 
 **要点**：容器网络接口规范，负责「给 Pod 分配 IP 并把它接入网络」。
@@ -2077,3 +2134,4 @@ kubectl get endpointslice -n <ns> -l kubernetes.io/service-name=<svc> \
 | DNAT | 改目标地址；只处理 TCP/UDP，ICMP 不通 |
 | iptables vs IPVS | 规则链表逐条匹配 vs 哈希表直查；差在更新成本与调度算法 |
 | EndpointSlice 拆分 | 每片最多 100 个 endpoint；按 addressType/端口分，**不按 zone** |
+| RuntimeClass | 按 Pod 选运行时；`handler` 名必须与节点 CRI 配置一致 |
