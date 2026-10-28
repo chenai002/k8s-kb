@@ -484,6 +484,100 @@ spec:
 - Ingress 网关到后端的 mTLS 需要单独配置（`DestinationRule` 的 `ISTIO_MUTUAL` 或网关参数）。
 - `PeerAuthentication` 与 `DestinationRule` 配置冲突时，以更严格/更具体者为准（工作负载级 > namespace 级 > mesh 级）。
 
+### 6.2.1 istiod 是怎么把 mTLS 跑起来的
+
+**先划清职责**：
+
+```
+证书谁发？        → istiod 内部的 CA（历史名称 Citadel）
+加密谁做？        → Envoy 之间的 TLS 握手
+istiod 参与转发吗？ → 完全不参与
+```
+
+**一句话**：istiod 是「签证机关」，Envoy 是「持证人」，加密连接由 Envoy 自己完成。
+
+#### 证书签发链路
+
+```
+① Pod 启动，挂载 ServiceAccount token（projected volume）
+        ↓
+② sidecar 的 Envoy 通过 SDS 向 istiod 的 15012 端口申请证书
+   （gRPC 流，请求里带 SA token 证明"我是谁"）
+        ↓
+③ istiod 的 CA 校验：
+   · token 是否有效（TokenReview）
+   · 该 SA 是否真实存在
+        ↓
+④ 签发 X.509 证书：
+   · Subject / URI SAN = spiffe://cluster.local/ns/shop/sa/frontend
+   · 有效期默认 24 小时
+   · 由 Istio 内置 CA 签名（默认自签根，可替换为自有 CA / Vault / KMS）
+        ↓
+⑤ 通过 SDS 下发证书，私钥只在 Envoy 进程内存中
+        ↓
+⑥ Envoy 用它做 mTLS，并在到期前**自动续期**（无需重启 Pod）
+```
+
+**两个关键点**：
+- **私钥不上传**到 istiod，istiod 只负责签名。
+- 证书轮换由 SDS 完成，**不中断现有连接**（新连接用新证书）。
+
+#### 握手时双方校验什么
+
+```
+A 的 Envoy                                    B 的 Envoy
+    │──── ClientHello ──────────────────────▶ │
+    │◀─── ServerHello + B 的证书 ─────────────│
+    │  B 证书的 URI SAN = spiffe://.../sa/backend，      │
+    │  用 istiod 的根证书验证签名                        │
+    │──── A 的证书 ─────────────────────────▶ │
+    │        双方校验通过 → 加密通道建立                 │
+```
+
+- **双向都校验**（这才是 mutual）。
+- 校验依据是**信任根**（istiod 根证书）+ **URI SAN**，**不看 IP**。所以 Pod 换 IP、换节点，身份不变。
+- Istio 会让 Envoy 只接受 SAN 符合 `spiffe://<trust-domain>/ns/*/sa/*` 的证书。
+
+#### PERMISSIVE 是怎么做到"两种都收"的
+
+这是迁移期不中断服务的关键。实现方式是：入站 **15006** 端口上启用 `tls_inspector` 网络过滤器，**先探测**第一个包是不是 TLS：
+
+```
+入站包 → tls_inspector 探测
+            ├─ 是 TLS  → 走 mTLS filter chain（校验证书）
+            └─ 不是     → 走明文 filter chain
+```
+
+切换 `STRICT` 后，明文那条 filter chain 被移除，所以非 mTLS 连接会被直接拒绝（表现为连接 reset）。
+
+#### 故障与运维视角
+
+| 场景 | 影响 |
+| --- | --- |
+| istiod 全挂 | 已签发证书继续有效、已建连接不受影响；但**证书到期时新连接会失败** |
+| 证书过期 | 握手失败，报 `certificate has expired` 一类错误 |
+| 迁移到 STRICT 后部分调用失败 | 通常是没有 sidecar 的客户端（Job、外来服务、hostNetwork Pod） |
+| 想替换 CA | 通过 `cacerts` Secret 提供根证书与中间证书，或配置 `PILOT_CERT_PROVIDER` 对接外部 CA |
+
+#### 检查 mTLS 是否真的生效
+
+```bash
+# 看 sidecar 拿到的证书（SAN、有效期、签发者）
+istioctl proxy-config secret <pod> -n <ns>
+
+# 看工作负载的 mTLS 状态与生效策略
+istioctl x describe pod <pod> -n <ns>
+
+# 用指标确认：只有 mutual_tls 才是真正加密的
+istio_requests_total{connection_security_policy="mutual_tls"}
+```
+
+#### 面试加分点
+
+- **"istiod 挂了 mTLS 还能用吗？"** 能，直到证书到期；到期后新连接失败，已建连接仍存活。
+- **"证书泄漏怎么办？"** 证书只绑定一个 SA；撤销靠轮换 CA 根证书（全部立即失效）或等待短期证书自然过期——这也是为什么生产建议用较短有效期。
+- **"Ambient 模式下机制变了吗？"** 身份与签发机制不变（同样 SDS + SPIFFE），只是**执行加密的是节点级 ztunnel**，不是每 Pod 一个 Envoy。
+
 ### 6.3 请求认证（JWT）
 
 ```yaml
