@@ -1280,6 +1280,100 @@ Cilium：     tunnel: vxlan 或 routingMode: native，也可混合
 跨云 / 混合云 ───────▶ overlay（可加 WireGuard 加密）
 ```
 
+### 48.2 VXLAN 和 MTU 是什么？（以及它们为什么绑在一起）
+
+**要点**：**VXLAN 是封装协议，MTU 是单包大小上限；VXLAN 的封装头会吃掉 MTU 配额，所以用了 VXLAN 必须把 Pod MTU 调小。**
+
+#### VXLAN 是什么
+
+把原始数据包**整体封装进一个外层 UDP 包**，外层用节点真实 IP，从而让 Pod 的虚拟网络跨过真实底层网络。
+
+```
+内层：src=10.244.1.5 (Pod A) → dst=10.244.2.7 (Pod B)
+        ↓ 封装
+外层：src=192.168.1.10 (节点A) → dst=192.168.1.11 (节点B)，UDP 4789
+        ↓ 走真实网络 → 对端拆封 → 交给 Pod B
+```
+
+包头结构：
+
+```
+外层以太网头(14B) + 外层IP头(20B) + 外层UDP头(8B) + VXLAN头(8B) = 额外 50 字节
+```
+
+VXLAN 头里含 **VNI**（虚拟网络标识），可支持约 1600 万个网络，远多于 VLAN 的 4094。
+
+| 优点 | 缺点 |
+| --- | --- |
+| 与底层网络解耦，部署简单 | 50 字节封装开销 |
+| Pod 网段可自由规划 | 封装/解包耗 CPU |
+| 不依赖交换机能力 | **MTU 必须调小** |
+| 支持海量虚拟网络 | 抓包需拆封 |
+
+#### MTU 是什么
+
+**最大传输单元**：一张网卡一次能发的最大包大小，以太网默认 **1500 字节**。
+
+```
+1500B = IP头(20) + TCP头(20) + 数据(1460)
+```
+
+超过 MTU 的包会被**分片**或**直接丢弃**（设置了 Don't Fragment 时），而且**通常不会明确报错**。
+
+#### 为什么两者绑在一起
+
+```
+节点网卡 MTU = 1500
+VXLAN 封装   = +50
+若 Pod 仍按 1500 发包 → 总长 1550 > 1500 → 丢包/分片
+
+所以：Pod MTU 必须设成 1450（1450 + 50 = 1500）
+```
+
+**封装开销与推荐 MTU**：
+
+| 封装方式 | 额外开销 | 节点 MTU 1500 时 Pod 应设 |
+| --- | --- | --- |
+| 无封装（Underlay） | 0 | 1500 |
+| **VXLAN** | **50** | **1450** |
+| IPIP | 20 | 1480 |
+| WireGuard | ~60 | 1440 |
+| VXLAN + WireGuard | ~110 | 1390 |
+
+**谁来设置**：Pod 网卡 MTU 由 **CNI 插件**负责（Calico 的 `veth_mtu`、Flannel 自动计算）；TCP 侧还可由 iptables `TCPMSS` 钳制。多数 CNI 会自动算对，但混合网络、跨云、叠加 VPN/IPsec 时容易出错。
+
+#### 典型症状
+
+```
+握手成功（小包）→ 请求头发出（小包）→ 大响应超 MTU 被静默丢弃 → 一直等到超时
+```
+
+所以表现为：**能打开页面但下载失败；小 JSON 正常，大 JSON 卡住。**
+
+#### 排查
+
+```bash
+# 1. 禁止分片，逐步加大包大小（-s 是数据部分，实际包大小 +28）
+kubectl exec <pod> -- ping -M do -s 1400 -c 3 <对端PodIP>
+
+# 2. 对比 Pod 与节点的 MTU
+kubectl exec <pod> -- cat /sys/class/net/eth0/mtu
+ip link show <节点网卡>
+
+# 正常情况下：Pod MTU = 节点 MTU - 封装开销
+# 若用了 VXLAN 而两者相等 → 一定配错了
+
+# 3. 节点抓包看分片
+tcpdump -i any -n -v 'tcp or icmp'
+```
+
+#### 常见误解
+
+- ❌「MTU 是带宽」——它是**单包大小上限**，不是速率。
+- ❌「用了 VXLAN 不影响 MTU」——**必然影响**，50 字节要从 Pod MTU 里扣。
+- ❌「应用能感知到 MTU 问题」——通常感知不到，只表现为偶发超时或大响应失败。
+- ⚠️「ICMP 被禁就查不出来」——可用 `curl --max-time`、`nc` 或 `tracepath` 间接定位。
+
 ### 49. Service 的 DNS 记录长什么样？
 
 **要点**：`<service>.<namespace>.svc.<cluster-domain>`，默认 `cluster.local`。
@@ -2559,6 +2653,7 @@ spec:
 | emptyDir | 跟 Pod 生灭；可 `medium: Memory`；**容器重启保留、Pod 重建丢失** |
 | 网络隔离 | NetworkPolicy，需要 CNI 支持 |
 | Overlay vs Underlay | Overlay 封装（MTU 要减）vs 真实 IP 路由（性能好但耗 IP） |
+| VXLAN 与 MTU | VXLAN 封装 +50B，节点 1500 时 Pod 设 1450；症状是大包卡住 |
 | 权限最小化 | RBAC + PSA + drop capabilities |
 | 发布策略 | 滚动 / 蓝绿 / 金丝雀 / 灰度，配合 PDB |
 | 蓝绿 vs 灰度 | 蓝绿=全切快回滚但资源翻倍；灰度为总称，金丝雀是其子集 |
