@@ -1174,6 +1174,112 @@ K8s 原生的 `RollingUpdate` **不属于上面任何一种**：它只保证「�
 - 「跨节点不通但同节点通？」多半是路由/BGP 断开或安全组/防火墙阻断封装端口（VXLAN 4789/UDP、IPIP）。
 - 「MTU 设置在哪？」CNI 配置（如 Calico 的 `veth_mtu`）、节点网卡 MTU；不一致会导致大包丢失。
 
+### 48.1 Overlay 和 Underlay 分别是什么？
+
+**要点**：**Underlay 是真实的物理网络，Overlay 是建在它之上的虚拟网络。** Overlay 必须跑在 Underlay 上，Underlay 对 Overlay 的存在一无所知。
+
+| | 是什么 | 打个比方 |
+| --- | --- | --- |
+| **Underlay（底层网络）** | 真实存在的物理网络：交换机、路由器、网卡、真实 IP 路由 | 城市的道路系统 |
+| **Overlay（覆盖网络）** | 建在 underlay 之上的虚拟网络：把包再封一层，靠底层转发 | 在道路上跑的快递专线，包裹外面再套个箱子 |
+
+#### Underlay：真实的网络
+
+就是机房/云 VPC 里那套真实 IP 网络：物理或虚拟网卡、交换机、路由器、BGP/OSPF、安全组 ACL。
+
+**特点**：
+- **每个地址都真实存在于某台机器上**，`ip addr` 看得见、`ping` 得到。
+- 由网络团队或云厂商管理，K8s 管不着。
+- 带宽与延迟的物理上限由它决定。
+
+**在 K8s 里就是：Pod IP 直接就是真实网络里的 IP。**
+
+```
+节点 A（10.0.1.10）              节点 B（10.0.1.11）
+  Pod: 10.0.1.20                   Pod: 10.0.1.21
+        ↑ 这些 IP 在网络里真实存在，路由器直接转发
+```
+
+| 优点 | 缺点 |
+| --- | --- |
+| 无封装开销，性能最好 | **IP 消耗大**，每个 Pod 占一个真实 IP |
+| 抓包直观、排障简单 | 需要底层网络配合（VPC 路由、交换机容量） |
+| 与外部系统互通简单 | Pod 数量受 IP 规划限制 |
+
+**典型实现**：AWS VPC CNI、Azure CNI（标准模式）、Calico BGP、Cilium native routing。
+
+#### Overlay：封装的虚拟网络
+
+把 Pod 的包再套一层外层包头，通过真实网络传过去，对端再拆开。
+
+```
+Pod A 发送：  [ 内层 src=10.244.1.5 dst=10.244.2.7 数据 ]
+                   ↓ 节点 A 的 CNI 封装
+             [ 外层 src=192.168.1.10 → dst=192.168.1.11 ][ 内层包 ]
+                   ↓ 走真实网络
+             节点 B 的 CNI 拆包 → 交给 10.244.2.7
+```
+
+**关键理解**：
+- **外层用节点真实 IP**，underlay 只看到「节点 A → 节点 B」的流量。
+- **内层是 Pod IP**，underlay 完全不关心。
+- 所以 **Pod 网段可以随便规划**，只要不与底层冲突。
+
+| 封装协议 | 开销 | 说明 |
+| --- | --- | --- |
+| VXLAN | 50 字节 | 最常用（UDP 4789） |
+| IPIP | 20 字节 | Calico 的轻量方案 |
+| Geneve | 可变 | 更灵活，Cilium/OVS 支持 |
+| WireGuard | ~60 字节 | 加密隧道，跨云常用 |
+
+| 优点 | 缺点 |
+| --- | --- |
+| 与底层网络解耦，部署简单 | 封装/解包消耗 CPU |
+| IP 规划自由，不消耗 VPC 子网 | **MTU 要减**，否则大包丢失 |
+| 不依赖交换机能力 | 抓包需拆封，排障链路变长 |
+
+#### 对比
+
+| 维度 | Underlay | Overlay |
+| --- | --- | --- |
+| Pod IP 是否真实存在 | ✅ | ❌ |
+| 底层网络感知 Pod | ✅ | ❌（只看到节点间流量） |
+| 性能 | **最好** | 有封装开销 |
+| IP 消耗 | 大 | 小 |
+| IP 规划自由度 | 受限 | 高 |
+| MTU | 正常 1500 | 需下调（如 1450） |
+| 与外部互通 | 简单 | 需额外配置 |
+| 典型实现 | VPC CNI、Calico BGP | Flannel VXLAN、Calico IPIP |
+
+#### 混合模式（实际最常见）
+
+很多 CNI 支持「同子网走 underlay、跨子网走 overlay」：
+
+```
+Calico IPIP：同子网 Pod 之间直接路由（不封装）
+             跨子网才 IPIP 封装
+Cilium：     tunnel: vxlan 或 routingMode: native，也可混合
+```
+
+好处是**本地流量零开销，跨域才付封装成本**。
+
+#### 常见误解
+
+- ❌「Overlay 就是 VPN」：VPN 通常加密且点到点；Overlay 主要是封装，不一定加密。
+- ❌「用了 Overlay 就不用管 MTU」：**必须管**，否则大包会莫名丢失。
+- ❌「Overlay 下 Pod IP 对外不可见 = 集群内也不可用」：集群内 Pod 之间仍用 Pod IP 通信。
+- ⚠️「Underlay 一定更快」：通常更快，但底层网络拥塞时未必。
+
+#### 选型
+
+```
+公有云、规模不大 ──▶ 云厂商 CNI（underlay）
+规模大 / IP 不够 ──▶ overlay（或混合）
+自有 IDC、有 BGP ──▶ Calico BGP / Cilium native（underlay）
+快速上线、不想动网络 ─▶ VXLAN overlay
+跨云 / 混合云 ───────▶ overlay（可加 WireGuard 加密）
+```
+
 ### 49. Service 的 DNS 记录长什么样？
 
 **要点**：`<service>.<namespace>.svc.<cluster-domain>`，默认 `cluster.local`。
@@ -2365,6 +2471,7 @@ volumes:
 | StatefulSet 管理 | 稳定身份（名字/DNS/PVC）+ 默认有序 + 逆序更新；partition 控升级 |
 | emptyDir | 跟 Pod 生灭；可 `medium: Memory`；**容器重启保留、Pod 重建丢失** |
 | 网络隔离 | NetworkPolicy，需要 CNI 支持 |
+| Overlay vs Underlay | Overlay 封装（MTU 要减）vs 真实 IP 路由（性能好但耗 IP） |
 | 权限最小化 | RBAC + PSA + drop capabilities |
 | 发布策略 | 滚动 / 蓝绿 / 金丝雀 / 灰度，配合 PDB |
 | 蓝绿 vs 灰度 | 蓝绿=全切快回滚但资源翻倍；灰度为总称，金丝雀是其子集 |
