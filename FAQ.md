@@ -87,6 +87,91 @@
 - StatefulSet 的 Pod 重建后 IP 会变，但 DNS 名和 PVC 不变；**它不解决数据一致性**，一致性要靠应用或 Operator。
 - DaemonSet 与节点 taint 的交互经常考：节点 NotReady/DiskPressure 时 daemonset Pod 也会被驱逐，除非加 toleration；这也是「kubectl drain 后日志 agent 没了」的原因。
 
+### 4.1 StatefulSet 是怎么管理 Pod 的？
+
+**要点**：给每个 Pod 一个**稳定的身份**（名字、DNS、存储），并默认**有序**地创建/更新/删除——这三件事 Deployment 都做不到。
+
+**展开**：
+
+#### 1. 身份是"算出来的"，不是随机的
+
+```
+StatefulSet: mysql (serviceName: mysql-headless, replicas: 3)
+  Pod 名：    mysql-0 / mysql-1 / mysql-2      ← 固定序号，可预测
+  DNS：      mysql-0.mysql-headless.<ns>.svc   ← 每个 Pod 一个稳定域名
+  PVC：      data-mysql-0 / data-mysql-1 / …   ← 由 volumeClaimTemplates 生成
+```
+
+**关键：Pod 重建后名字、DNS、PVC 都不变，只有 IP 会变。** 这就是"稳定身份"。
+
+#### 2. 有序性（默认 `podManagementPolicy: OrderedReady`）
+
+| 操作 | 行为 |
+| --- | --- |
+| **创建/扩容** | 严格按 `0 → 1 → 2`，**前一个 Ready 才建下一个** |
+| **删除/缩容** | 严格按 `2 → 1 → 0` **逆序** |
+| **滚动更新** | 默认从**最大序号**往小更新，前一个 Ready 才继续 |
+
+改成 `podManagementPolicy: Parallel` 可以并行创建（适合各 Pod 无依赖的场景，如某些分布式缓存），但**更新仍是逆序**。
+
+**为什么默认有序**：有状态服务通常有依赖关系——主节点先起，从节点才能加入集群；分片按序号分配。
+
+#### 3. 存储是"跟着序号"的
+
+```yaml
+volumeClaimTemplates:
+  - metadata: { name: data }
+    spec:
+      accessModes: [ReadWriteOnce]
+      resources: { requests: { storage: 10Gi } }
+```
+
+- 每个 Pod 拿到**自己专属的 PVC**（`data-mysql-0`），别的 Pod 抢不走。
+- Pod 被删/漂移到别的节点，**重建后仍挂载自己原来的 PVC**，数据不丢。
+- **删除 StatefulSet 默认不删 PVC**（保护数据）；缩容也不删。
+- 需要自动清理时用 `persistentVolumeClaimRetentionPolicy`（`WhenDeleted` / `WhenScaled`）。
+
+#### 4. 更新策略
+
+```yaml
+updateStrategy:
+  type: RollingUpdate        # 默认；按序号 2→1→0 逆序更新
+  # type: OnDelete           # 只更新你手动删掉的 Pod，升级节奏完全自己控
+  rollingUpdate:
+    partition: 2             # 只更新序号 >= 2 的 Pod（其余保持旧版本）
+```
+
+- **`partition`** 是很有用的技巧：可以让 `mysql-2`、`mysql-1` 先升级，`mysql-0`（主）保持旧版本，观察后再把 partition 降到 0。
+- **`OnDelete`**：完全手动控制，适合必须由 Operator 协调的场景（数据库主从切换）。
+
+#### 5. 扩缩容与故障时的行为
+
+| 场景 | 行为 |
+| --- | --- |
+| 扩容 | 从当前最大序号 +1 开始，顺序创建 |
+| 缩容 | 从最大序号开始逆序删除，**PVC 保留** |
+| Pod 崩溃 | 原地重建**同一个名字**的 Pod（序号不变） |
+| 节点失联 | Pod 被驱逐后**在别的节点重建同名 Pod**，但需要等旧 Pod 真正退出，否则 RWO 卷会挂载冲突 |
+| 跨 zone 漂移 | 若 PVC 绑定了某个 zone，新节点必须在同 zone，否则 Pending |
+
+#### 6. 与 Deployment 的对比
+
+| 维度 | Deployment（RS） | StatefulSet |
+| --- | --- | --- |
+| Pod 名 | 随机后缀 `app-7d9f-x2k` | **固定序号** `app-0/1/2` |
+| 网络标识 | 无（靠 Service 负载均衡） | **每 Pod 独立 DNS** |
+| 存储 | 共享或临时 | **每 Pod 独立 PVC** |
+| 创建顺序 | 并行 | **默认串行有序** |
+| 替换身份 | 新 Pod 是新身份 | **同序号重建，身份不变** |
+| 适合 | 无状态 | 有状态（数据库、MQ、集群） |
+
+**面试加分点**：
+- 「StatefulSet 能保证数据一致吗？」**不能**。它只保证身份与顺序，主从选举、数据同步要靠应用或 Operator。
+- 「为什么必须有 Headless Service？」因为稳定 DNS `<pod>.<svc>` 需要 Headless（`clusterIP: None`）才能解析到**具体 Pod**，而不是负载均衡后的 VIP。
+- 「缩容后数据还在吗？」在，PVC 保留；重新扩容到同样序号会**重新挂载原 PVC**。
+- 「和 DaemonSet 的区别？」DaemonSet 按**节点**分布，StatefulSet 按**序号**分布。
+- 「为什么滚动更新是逆序？」让序号大的（通常是从节点/非核心分片）先更新，主节点最后动，降风险。
+
 ### 5. Job 和 CronJob 的区别？
 
 **要点**：Job 是「跑到成功为止的一次性任务」，CronJob 是「按时间表生成 Job」。
@@ -2193,6 +2278,7 @@ K8s 原生的 `RollingUpdate` **不属于上面任何一种**：它只保证「�
 | 证书轮换 | kubeadm certs renew / 托管集群自动 |
 | 优雅下线 | SIGTERM + preStop + 足够 grace period |
 | 有状态服务 | StatefulSet + PVC 模板 + Operator |
+| StatefulSet 管理 | 稳定身份（名字/DNS/PVC）+ 默认有序 + 逆序更新；partition 控升级 |
 | 网络隔离 | NetworkPolicy，需要 CNI 支持 |
 | 权限最小化 | RBAC + PSA + drop capabilities |
 | 发布策略 | 滚动 / 蓝绿 / 金丝雀 / 灰度，配合 PDB |
