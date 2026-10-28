@@ -535,3 +535,5 @@ K8s 里声明云资源 → Crossplane 控制器去创建
 | 生产防护 | plan 审批、加锁、禁 destroy、`prevent_destroy`、静态扫描 |
 | 安全凭据 | CI 用 OIDC 临时凭证，不存长期 AK |
 | 开源替代 | OpenTofu（Terraform 的社区分支） |
+
+> 详细展开见 [`terraform.md`](./terraform.md)：基本概念与处理流程。
