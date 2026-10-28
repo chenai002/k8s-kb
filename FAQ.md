@@ -1,4 +1,4 @@
-# Kubernetes 面试 FAQ（100 题·详解版）
+# Kubernetes 面试 FAQ（100 题 + 扩展·详解版）
 
 > 面向中高级 Kubernetes / 云原生岗位的面试准备材料。
 > 每题包含：**核心答案要点** → **展开说明**（原理 / 机制 / 细节）→ **面试加分点**（追问、坑点、实战）。
@@ -16,7 +16,7 @@
 - [六、安全（71–82）](#六安全7182)
 - [七、可观测性与运维（83–92）](#七可观测性与运维8392)
 - [八、故障排查实战（93–97）](#八故障排查实战9397)
-- [九、生产实践与进阶（98–100）](#九生产实践与进阶98100)
+- [九、生产实践与进阶（98–101）](#九生产实践与进阶98101)
 - [附：高频追问速记](#附高频追问速记)
 
 ---
@@ -2380,7 +2380,7 @@ volumes:
 
 ---
 
-## 九、生产实践与进阶（98–100）
+## 九、生产实践与进阶（98–101）
 
 ### 98. 生产集群的设计要点有哪些？
 
@@ -2457,6 +2457,93 @@ volumes:
 - 「瓶颈通常在哪？」etcd 写入、apiserver 请求放大、网络规则规模、调度器过滤性能。
 - 「如何量化？」用 SLO 指标（调度延迟、API 延迟、Pod 启动时间）+ 压测，不要凭感觉。
 
+### 101. Argo CD 是什么？它是怎么工作的？
+
+**要点**：K8s 的 **GitOps 持续交付工具**——把 Git 当唯一事实来源，运行在集群里持续比对并同步到集群。
+
+**展开**：
+
+一句话定位：
+
+```
+Git 仓库（期望状态） ──Argo CD 持续对账──▶ K8s 集群（实际状态）
+```
+
+**解决推模型的问题**：
+
+| 推模型（CI 直推） | Argo CD（拉模型） |
+| --- | --- |
+| CI 要持生产集群 kubeconfig | 凭据只在集群内 |
+| 手改配置无人知 | 自动检测漂移（`OutOfSync`），可 `selfHeal` |
+| 回滚靠脚本 | 回滚 = Git revert，可审计 |
+| 多集群要配多套流水线 | 一个 Argo CD 管多集群 |
+
+**核心对象**：
+
+| 对象 | 含义 |
+| --- | --- |
+| **Application** | 一个部署单元：「哪个 Git 路径 → 哪个集群的哪个 namespace」 |
+| **AppProject** | 权限边界：哪些 Git 仓库能部署到哪些集群/namespace |
+| **ApplicationSet** | 用模板+生成器批量创建 Application（多集群/多环境） |
+| **Sync / Sync Policy** | 手动或自动同步；`prune` 清理多余资源、`selfHeal` 自动纠偏 |
+| **Health / Sync Status** | `Healthy/Degraded` 与 `Synced/OutOfSync` |
+
+**最小示例**：
+
+```yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: my-app
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/example/repo
+    targetRevision: main
+    path: deploy/overlays/prod        # 也支持 helm / kustomize
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: prod
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+    syncOptions: [CreateNamespace=true]
+```
+
+**内部组件**：
+
+| 组件 | 职责 |
+| --- | --- |
+| **repo-server** | 拉 Git、渲染清单（YAML/Kustomize/Helm/Jsonnet） |
+| **application-controller** | 核心对账：diff → 同步 → 健康检查 |
+| **api-server** | Web UI / CLI / API |
+| **dex**（可选） | SSO 认证 |
+| **redis** | 缓存 |
+
+**同步流程**：定期（默认 3 分钟）拉 Git → 渲染 → 与集群 diff → Synced / OutOfSync → 同步时按序 apply（CRD 先于 workload，可用 `sync-wave` 注解控制顺序）。
+
+**与相邻工具的关系**：
+
+| 工具 | 关系 |
+| --- | --- |
+| **Flux CD** | 同类竞品；Argo CD 中心化 + 强 UI，Flux 分布式 + 更纯 K8s |
+| **Jenkins/GitLab CI** | **互补**：CI 构建镜像并更新 Git 里的 tag，Argo CD 负责部署 |
+| **Helm / Kustomize** | 被 Argo CD 消费（渲染源） |
+| **Argo Rollouts** | **互补**：Rollouts 负责灰度放量，Argo CD 负责部署到位 |
+
+**常见坑**：
+- **Secret 不能明文进 Git**：用 Sealed Secrets / SOPS / External Secrets。
+- **`prune: true` 会删资源**，误操作风险高，建议配合 AppProject 限权。
+- **漂移检测假阳性**：HPA、default 值等被 controller 自动改的字段，需配 `ignoreDifferences`。
+- **一次同步太多资源会压垮 apiserver**：用 `sync-wave` 分批。
+- **Argo CD 自身需高可用**：它挂了不影响运行中的业务，但无法同步配置。
+
+**面试加分点**：
+- 「Argo CD 挂了业务会挂吗？」**不会**，它不在数据面；只是配置变更无法同步、UI 不可用。
+- 「和 Jenkins 什么关系？」**互补**：CI 构建产物并提交 Git，CD 负责把 Git 状态落到集群。
+- 「如何做多集群？」Application 的 `destination.server` 指向不同集群，或用 ApplicationSet 批量生成。
+- 「GitOps 能做灾备吗？」能——Git 里是完整状态，新集群建 Application 即可恢复，**前提是镜像与密钥可获取**。
+
 ---
 
 ## 附：高频追问速记
@@ -2484,6 +2571,7 @@ volumes:
 | CrashLoopBackOff | 退出码 + --previous 日志 + 探针 + 资源 |
 | 502 vs 503 | 后端连接异常 vs 无可用后端 |
 | 大规模优化 | 控制面限流、eBPF、拓扑感知、指标降基数 |
+| Argo CD | 集群内拉取 Git 对账；漂移自愈、回滚即 revert |
 | kube-proxy 部署 | 每节点一个 DaemonSet；eBPF 替代后仍是每节点一个 Agent |
 | DNAT | 改目标地址；只处理 TCP/UDP，ICMP 不通 |
 | iptables vs IPVS | 规则链表逐条匹配 vs 哈希表直查；差在更新成本与调度算法 |
