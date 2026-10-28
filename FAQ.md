@@ -436,6 +436,62 @@
 - Localhost 访问 ClusterIP 时，iptables 的 DNAT 在 OUTPUT 链也会生效，但源地址保持本机。
 - 故障现象：Service 存在但 `curl` 不通、Pod 正常——先看 `ipvsadm -Ln` / `iptables -t nat -L KUBE-SERVICES`。
 
+### 24.1 kube-proxy 是部署在每个节点上的吗？
+
+**要点**：是。每个节点都要有，因为它是「本节点流量走向 Service 的规则维护者」。
+
+**展开**：
+- Service 的 ClusterIP 是虚拟地址，集群里没有任何主机真正拥有它；它能被访问，靠的是**每个节点自己**的转发规则。节点 1 上的 Pod 访问 Service，走的是节点 1 的网络栈，所以节点 1 必须有规则。
+- 典型部署形态是 **DaemonSet**（`kube-system/kube-proxy`），使用 `hostNetwork: true`，并挂载 `xtables`、`conntrack`、`nsenter` 等宿主工具，因为它要写宿主的 iptables/IPVS 规则。
+- **kube-proxy 本身不转发流量**，只「写规则」；真正转发的是内核。所以 kube-proxy 挂掉后，已有规则继续生效，只是不再随 Service/Endpoint 变化更新。
+
+**例外与替代**：
+- 控制面节点：kubeadm 默认也跑；托管集群的控制面节点不在你的节点池里，自然没有。
+- **eBPF 替代**：Cilium 的 `kubeProxyReplacement: true` 不部署 kube-proxy，改由每节点上的 Cilium Agent 用 eBPF 完成转发——**仍然是每节点一个**。
+- NodeLocal DNSCache 之类的组件也是每节点一个，但它们不替代 kube-proxy。
+
+### 24.2 DNAT 是什么？
+
+**要点**：Destination NAT，在转发过程中把数据包的**目标 IP/端口**改写成另一个。
+
+**展开**：
+- 访问 Service 时：Pod 发出 `dst = 10.96.0.10:80`（ClusterIP，虚拟地址）→ 节点内核的 iptables/IPVS 规则做 DNAT → 实际发出时 `dst = 10.244.1.7:8080`（真实 Pod IP）。
+- **DNAT vs SNAT**：DNAT 改目标（要去哪），SNAT 改源（从哪来）；两者常同时使用——DNAT 让包去对地方，SNAT 让回包能原路返回。
+- 只在**连接的第一个包**做，后续靠 conntrack 复用映射；所以 `conntrack` 表满时会出现「新连接建不上」的诡异问题。
+- 对应用**完全透明**：应用看到的目标还是 ClusterIP，响应由内核反向改回。
+- 只处理 **TCP/UDP，不处理 ICMP**——这就是为什么 `ping` 一个 ClusterIP 通常不通，测通不通要用 `curl`/`nc`。
+
+**面试加分点**：
+- 「Service 是负载均衡器吗？」严格说不是，它是**一个虚拟 IP + 一组 DNAT 规则**，负载均衡来自「从后端列表里按规则挑一个」。
+- 不同模式的实现：iptables 用 nat 表规则、IPVS 用 `kube-ipvs0` + LVS、eBPF 直接在程序里改写目标地址。
+
+### 24.3 iptables 模式与 IPVS 模式的区别是什么？
+
+**要点**：iptables 是「规则链表逐条匹配」，IPVS 是「哈希表直接查」，本质是**数据结构**的差异。
+
+**展开**：
+
+| 维度 | iptables | IPVS |
+| --- | --- | --- |
+| 底层 | netfilter nat 表 | 内核 LVS 模块 |
+| 查找 | 线性遍历规则链，O(N) | 哈希表，O(1) |
+| 扩容性 | 每个 Service/Endpoint 一条规则，线性增长 | 一条记录对应一组后端 |
+| 更新 | 每次变更**全量重写**规则，规模大时性能抖动明显 | 增量更新单条记录 |
+| 调度算法 | 概率均分（随机） | rr / lc / wrr / sh / sed / nq |
+| 大集群 | Service 上千后明显退化 | 更稳 |
+| 依赖 | 无 | 需要 `ip_vs` 内核模块 |
+
+- **最关键的是更新成本**：3000 个 Service × 10 个后端 ≈ 3 万条 iptables 规则，任何一个 Pod 就绪变化都可能触发全量重写；IPVS 只改受影响的一条。
+- IPVS 模式下节点会多出 `kube-ipvs0` 虚拟网卡，所有 VIP 挂在其上（`ip addr` 可见）。
+
+**常见误解**：
+- ❌「IPVS 就不需要 iptables 了」——仍需要，NodePort 的 DNAT、hairpin 流量等边缘规则还在 iptables 里，只是「以 IPVS 为主、iptables 为辅」。
+- ❌「IPVS 一定更快」——匹配阶段更快，但 **conntrack 仍是共同瓶颈**；小集群感受不到差异。
+- ❌「换模式能解决性能问题」——大规模真正的瓶颈常在 etcd 写入、apiserver 压力与 conntrack 表。
+
+**选型**：小中规模用 iptables（最省心）；数千 Service 或需要会话保持/特定算法用 IPVS；新集群关注 nftables 或 Cilium eBPF。
+
+
 ### 25. 容器运行时接口 CRI 是什么？
 
 **要点**：kubelet 与容器运行时之间的 gRPC 契约，解耦运行时的实现。
@@ -1958,3 +2014,6 @@
 | CrashLoopBackOff | 退出码 + --previous 日志 + 探针 + 资源 |
 | 502 vs 503 | 后端连接异常 vs 无可用后端 |
 | 大规模优化 | 控制面限流、eBPF、拓扑感知、指标降基数 |
+| kube-proxy 部署 | 每节点一个 DaemonSet；eBPF 替代后仍是每节点一个 Agent |
+| DNAT | 改目标地址；只处理 TCP/UDP，ICMP 不通 |
+| iptables vs IPVS | 规则链表逐条匹配 vs 哈希表直查；差在更新成本与调度算法 |
