@@ -560,6 +560,65 @@
 - 「Service 有 Endpoints 但没 EndpointSlice？」检查 EndpointSlice controller 是否正常（KCM 的一个 controller）、label `kubernetes.io/service-name` 是否正确。
 - 拓扑感知路由（`trafficDistribution: PreferClose`，1.31 GA）依赖 EndpointSlice 的 zone 信息，可减少跨区流量。
 
+### 28.1 Endpoints 和 EndpointSlice 的结构差别
+
+**要点**：Endpoints 是「一个对象装全部后端」，EndpointSlice 是「按上限切片的一组对象」。
+
+| 维度 | Endpoints（`v1`） | EndpointSlice（`discovery.k8s.io/v1`） |
+| --- | --- | --- |
+| 与 Service 关联 | **同名** | label `kubernetes.io/service-name` |
+| 一个 Service 对应几个对象 | **1 个** | **N 个** |
+| 单对象大小 | 随后端数线性增长 | 有上限（默认 100） |
+| 更新粒度 | 任一端点变化 → 整对象重写 | 只更新变化的 slice |
+| 拓扑信息 | 仅 `nodeName` | `zone`、`region`、`hostname` |
+| 端点状态 | 在/不在列表 | `ready` / `serving` / `terminating` 三个独立条件 |
+| 地址类型 | 隐含 | 显式 `addressType`：IPv4 / IPv6 / FQDN |
+
+**`serving` 条件的价值**：Pod 优雅退出时，Endpoints 只能表达「在」或「不在」，无法表示「别发新请求但还能处理存量」。EndpointSlice 用 `ready=false` + `serving=true` 表达了这种中间态。
+
+### 28.2 是怎么拆分到 EndpointSlice 的
+
+**要点**：由 **EndpointSlice controller**（kube-controller-manager 中的一个控制器）**直接从 Service + Pod 生成**，生成时按「数量上限、地址类型、端口」分片，**不按 zone 分片**。
+
+**五条拆分规则**：
+
+1. **数量上限（主规则）**：每个 slice 最多 100 个 endpoint（`endpointslice.kubernetes.io/max-endpoints` 注解；可用 KCM 的 `--max-endpoints-per-slice` 调整，上限 1000）。
+   ```
+   100 个后端 → 1 个 slice；101 个 → 2 个（100+1）；500 个 → 5 个
+   ```
+2. **必须按 addressType 分开**：一个 slice 内只能有一种地址类型。双栈集群下，同一 Service 会同时有 IPv4 和 IPv6 两组 slice。
+3. **按端口集合分组**：端口组合不同的端点不会混在同一个 slice。
+4. **装箱而非均分**：优先塞进还有空位的 slice，都满了才新建。所以填充率可能不均（如 100/100/37）。
+5. **拓扑信息不参与分片**：`zone`/`region` 只是写进每个 endpoint 的字段，同一个 slice 里可以混有不同 zone 的 Pod；拓扑路由是在 slice **内部按字段过滤**。
+
+**重要澄清**：不是「Endpoints 拆成 EndpointSlice」，而是两者都由控制器**从同一数据源独立生成**，`Endpoints` 反而是兼容产物。
+
+**更新行为**：
+
+| 事件 | 行为 |
+| --- | --- |
+| 新增 Pod | 塞进有空位的 slice，都满则新建 |
+| 删除 Pod | 只从所在 slice 移除，只更新这一个对象 |
+| ready → not ready | 只改该 endpoint 的 `conditions`，不删除 |
+| 后端全消失 | slice 被删除或变空 |
+
+**命名与归属**：
+- 名字格式 `<service-name>-<随机后缀>`（如 `reviews-7xk2p`），**不要硬编码**。
+- 归属靠 label `kubernetes.io/service-name`，管理方标记为 `endpointslice.kubernetes.io/managed-by=endpointslice-controller.k8s.io`。
+
+**常见误解**：
+- ❌「按 zone 分片」——不按 zone 分，zone 只是字段。
+- ❌「平均分配」——是装箱策略，分布可能不均。
+- ❌「每 100 个 Pod 一个 slice」——准确说法是「每个 slice 最多 100 个 endpoint」。
+- ❌「Endpoints 已废弃」——未废弃，仍由 EndpointSlice 镜像生成以兼容老客户端，但新代码不应依赖。
+
+**排障命令**：
+```bash
+kubectl get endpointslice -n <ns> -l kubernetes.io/service-name=<svc>
+kubectl get endpointslice -n <ns> -l kubernetes.io/service-name=<svc> \
+  -o custom-columns=NAME:.metadata.name,ADDR:.addressType,COUNT:.endpoints[*].addresses
+```
+
 ### 29. 什么是 Static Pod？
 
 **要点**：由 kubelet 直接读本地 manifest 创建的 Pod，不经过 apiserver 调度。
@@ -2017,3 +2076,4 @@
 | kube-proxy 部署 | 每节点一个 DaemonSet；eBPF 替代后仍是每节点一个 Agent |
 | DNAT | 改目标地址；只处理 TCP/UDP，ICMP 不通 |
 | iptables vs IPVS | 规则链表逐条匹配 vs 哈希表直查；差在更新成本与调度算法 |
+| EndpointSlice 拆分 | 每片最多 100 个 endpoint；按 addressType/端口分，**不按 zone** |
